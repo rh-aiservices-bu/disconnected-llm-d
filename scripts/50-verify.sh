@@ -152,7 +152,7 @@ printf '%s\n' "$resp" | jq . 2>/dev/null || printf '%s\n' "$resp"
 
 content="$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)"
 [[ -n "$content" ]] || die "no completion returned. Check the serving container:
-     oc logs -n ${LLMD_NAMESPACE} -l app.kubernetes.io/part-of=${ISVC} -c main --tail=100"
+     oc logs -n ${LLMD_NAMESPACE} -l app.kubernetes.io/name=${ISVC} -c main --tail=100"
 
 echo
 ok "model responded: ${content}"
@@ -164,7 +164,7 @@ cat <<EOF
 
     http://${LLMD_GATEWAY_NAME}-openshift-default.${LLMD_GATEWAY_NAMESPACE}.svc.cluster.local/${LLMD_NAMESPACE}/${ISVC}/v1
 
-  From your laptop, through the jump box (SOCKS proxy per the CRIAB cheatsheet),
+  From your laptop, through the jump box (SOCKS proxy per the disconnected RHOAI runbook),
   or keep using this port-forward:
 
     oc port-forward -n ${LLMD_GATEWAY_NAMESPACE} ${GW_SVC} ${PF_PORT}:80

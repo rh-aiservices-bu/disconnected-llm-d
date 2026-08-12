@@ -13,7 +13,7 @@
 #   2. Namespace and HardwareProfile.
 #   3. The LLMInferenceService.
 #
-# Long-running: run it under tmux or nohup per the CRIAB convention, and tee to
+# Long-running: run it under tmux or nohup per the convention, and tee to
 # /mnt/mirror. It prints "llm-d deploy complete" on success so a watcher can
 # poll for a marker rather than guess from process state.
 
@@ -73,8 +73,8 @@ if [[ "$LLMD_MANAGE_GATEWAY" == "true" ]]; then
 
      On a disconnected cluster there must be a CatalogSource literally named
      redhat-operators serving the MIRRORED index — the ingress operator
-     hard-codes that name. CRIAB creates it in phase 30 when
-     INSTALL_SERVICE_MESH3=true:  cd ~/criab && ./deploy-rhoai.sh 30"
+     hard-codes that name. the RHOAI install creates it in phase 30 when
+     INSTALL_SERVICE_MESH3=true:  cd <disconnected-rhoai> && ./deploy-rhoai.sh 30"
   fi
 
   # Ensure the Gateway itself exists even if the class was pre-created.
@@ -184,7 +184,7 @@ while (( SECONDS < deadline )); do
     ok "LLMInferenceService ${ISVC} is Ready"
     break
   fi
-  now="$(oc get pods -n "$LLMD_NAMESPACE" -l app.kubernetes.io/part-of="$ISVC" \
+  now="$(oc get pods -n "$LLMD_NAMESPACE" -l app.kubernetes.io/name="$ISVC" \
           --no-headers 2>/dev/null | awk '{print $1" "$3}' | sort | tr '\n' ' ')"
   [[ -z "$now" ]] && now="$(oc get pods -n "$LLMD_NAMESPACE" --no-headers 2>/dev/null \
           | awk '{print $1" "$3}' | sort | tr '\n' ' ')"
@@ -204,7 +204,7 @@ if ! isvc_ready; then
 
   oc get llminferenceservice ${ISVC} -n ${LLMD_NAMESPACE} -o yaml | yq '.status'
   oc get pods -n ${LLMD_NAMESPACE}
-  oc describe pod -n ${LLMD_NAMESPACE} -l app.kubernetes.io/part-of=${ISVC} | tail -40
+  oc describe pod -n ${LLMD_NAMESPACE} -l app.kubernetes.io/name=${ISVC} | tail -40
 
   Common causes here, most likely first:
 

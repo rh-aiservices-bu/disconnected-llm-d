@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Shared helpers. Sourced by every script in this repo.
 #
-# Deliberately standalone rather than sourcing CRIAB's scripts/lib/common.sh:
+# Deliberately standalone rather than sourcing the RHOAI install's own helpers:
 # this repo gets rsync'd to the lab hosts on its own, and a cross-repo source
-# breaks the moment someone syncs one without the other. It DOES read CRIAB's
+# breaks the moment someone syncs one without the other. It DOES read that install's
 # config/criab.env, because MIRROR_REGISTRY and the credentials must not be
 # duplicated.
 
@@ -89,7 +89,7 @@ k8s_bytes() {
 #
 # The ModelCar images are single-arch OCI manifests, so podman reports every one
 # of them as absent whether it is there or not. skopeo handles both but is not
-# installed on the CRIAB jump box. `oc image info` handles both and oc is
+# installed on the jump box. `oc image info` handles both and oc is
 # already a hard requirement everywhere, so it is the reliable default.
 registry_inspect() {
   local ref="$1" auth="${2:-}"
@@ -143,11 +143,11 @@ require_cmd() {
 require_vars() {
   local m=()
   for v in "$@"; do [[ -n "${!v:-}" ]] || m+=("$v"); done
-  (( ${#m[@]} == 0 )) || die "unset config value(s): ${m[*]} — check config/llmd.env and ${CRIAB_ENV:-criab.env}"
+  (( ${#m[@]} == 0 )) || die "unset config value(s): ${m[*]} — check config/llmd.env and ${RHOAI_REPO_ENV:-criab.env}"
 }
 
-# Load config/llmd.env, then CRIAB's config/criab.env for the registry and host
-# values. CRIAB's file wins for nothing — every var in both uses the
+# Load config/llmd.env, then the RHOAI install config for registry and host
+# values. That file wins for nothing — every var in both uses the
 # ${VAR:-default} form, so whichever is read first sticks. llmd.env is read
 # first on purpose: it may legitimately override e.g. WAIT_TIMEOUT.
 load_env() {
@@ -161,25 +161,32 @@ load_env() {
     set -a; source "${REPO_ROOT}/config/llmd.env.example"; set +a
   fi
 
-  # The CRIAB checkout lives at ~/criab on the lab hosts and usually under
-  # ~/projects on a laptop. Probe rather than make everyone edit the same line
-  # twice — this repo gets rsync'd to both, from one config file.
-  if [[ ! -f "${CRIAB_ENV:-/nonexistent}" ]]; then
-    for c in "${CRIAB_DIR:-}" "${HOME}/criab" "${HOME}/projects/criab" \
+  # Accept the old names so an existing config/llmd.env keeps working.
+  RHOAI_REPO_DIR="${RHOAI_REPO_DIR:-${CRIAB_DIR:-}}"
+  RHOAI_REPO_ENV="${RHOAI_REPO_ENV:-${CRIAB_ENV:-}}"
+
+  # The disconnected RHOAI install checkout has been called a few things and
+  # sits in a few places. Probe rather than make everyone edit the same line
+  # twice — this repo gets rsync'd to both hosts from one config file.
+  if [[ ! -f "${RHOAI_REPO_ENV:-/nonexistent}" ]]; then
+    for c in "${RHOAI_REPO_DIR:-}" \
+             "${HOME}/disconnected-rhoai" "${HOME}/projects/disconnected-rhoai" \
+             "$(dirname "$REPO_ROOT")/disconnected-rhoai" \
+             "${HOME}/criab" "${HOME}/projects/criab" \
              "$(dirname "$REPO_ROOT")/criab"; do
       [[ -n "$c" && -f "${c}/config/criab.env" ]] || continue
-      CRIAB_DIR="$c"; CRIAB_ENV="${c}/config/criab.env"
-      export CRIAB_DIR CRIAB_ENV
+      RHOAI_REPO_DIR="$c"; RHOAI_REPO_ENV="${c}/config/criab.env"
+      export RHOAI_REPO_DIR RHOAI_REPO_ENV
       break
     done
   fi
 
-  if [[ -f "${CRIAB_ENV:-/nonexistent}" ]]; then
+  if [[ -f "${RHOAI_REPO_ENV:-/nonexistent}" ]]; then
     # shellcheck disable=SC1090
-    set -a; source "$CRIAB_ENV"; set +a
+    set -a; source "$RHOAI_REPO_ENV"; set +a
   else
-    warn "no CRIAB env at ${CRIAB_ENV} — MIRROR_REGISTRY and host values will be unset"
-    warn "  set CRIAB_DIR in config/llmd.env to your CRIAB checkout"
+    warn "no disconnected-RHOAI config at ${RHOAI_REPO_ENV} — MIRROR_REGISTRY and host values will be unset"
+    warn "  set RHOAI_REPO_DIR in config/llmd.env to your disconnected-rhoai checkout"
   fi
 }
 
@@ -202,7 +209,7 @@ wait_for() {
 require_cluster_admin() {
   require_cmd oc
   oc whoami >/dev/null 2>&1 \
-    || die "not logged in — run: source ~/criab/scripts/ocp/oc-login.sh  (source it, do not execute it)"
+    || die "not logged in — run: source <disconnected-rhoai>/scripts/ocp/oc-login.sh  (source it, do not execute it)"
   oc auth can-i '*' '*' --all-namespaces >/dev/null 2>&1 \
     || die "need cluster-admin (current user: $(oc whoami))"
 }
@@ -274,7 +281,7 @@ mirror_candidates() {
 #
 # The mirror registry rejects /v2/_catalog, so presence is tested per-image with
 # `podman manifest inspect`. An empty catalog listing is not evidence of
-# anything — see the CRIAB cheatsheet.
+# anything — see the disconnected RHOAI runbook.
 mirror_has_image() {
   local ref="$1" cand found=1 any=0
   while read -r cand; do
@@ -302,7 +309,7 @@ mirror_login() {
   podman login --authfile "$PODMAN_AUTHFILE" \
     -u "$MIRROR_REGISTRY_USER" -p "$MIRROR_REGISTRY_PASSWORD" \
     "$MIRROR_REGISTRY" >/dev/null 2>&1 \
-    || die "cannot log in to ${MIRROR_REGISTRY} — check MIRROR_REGISTRY_USER/PASSWORD in ${CRIAB_ENV}"
+    || die "cannot log in to ${MIRROR_REGISTRY} — check MIRROR_REGISTRY_USER/PASSWORD in ${RHOAI_REPO_ENV}"
   chmod 600 "$PODMAN_AUTHFILE"
 }
 

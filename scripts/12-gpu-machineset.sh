@@ -66,9 +66,9 @@ if [[ -z "$SUBNET" ]]; then
     || die "worker MachineSet ${SRC_NAME} names its subnet neither by id nor by tag:Name — render manifests/gpu/machineset-l40s.yaml by hand"
   warn "worker set uses a subnet tag filter, not an id: ${SUBNET_FILTER}"
   warn "  resolving it would need AWS API access; set OCP_PRIVATE_SUBNET_ID in"
-  warn "  CRIAB's config to override, or edit the rendered manifest."
+  warn "  the disconnected RHOAI install's config to override, or edit the rendered manifest."
   SUBNET="${OCP_PRIVATE_SUBNET_ID:-}"
-  [[ -n "$SUBNET" ]] || die "no subnet id available — set OCP_PRIVATE_SUBNET_ID in ${CRIAB_ENV}"
+  [[ -n "$SUBNET" ]] || die "no subnet id available — set OCP_PRIVATE_SUBNET_ID in ${RHOAI_REPO_ENV}"
 fi
 
 [[ -n "$SG" ]] || SG="${INFRA_ID}-node"

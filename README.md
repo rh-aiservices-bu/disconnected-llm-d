@@ -1,525 +1,379 @@
-# llm-d on a disconnected RHOAI cluster
+# llm-d on a disconnected RHOAI install
 
-Deploys llm-d onto the CRIAB lab cluster — OpenShift 4.20 and RHOAI 3.4.2, no
-egress, images served from Quay on the high side.
+Deploys **llm-d** — distributed LLM inference — onto an air-gapped OpenShift AI
+cluster, where nothing can reach `quay.io`, `registry.redhat.io` or
+`huggingface.co` and every image must be in the local mirror registry first.
 
-This repo is the **llm-d layer only**. [CRIAB](../criab) builds everything
-underneath it and owns the mirror pipeline, the cluster and the credentials.
-Read [CRIAB's cheatsheet](../criab/CHEATSHEET.md) first — the SSH topology, the
-`/mnt/mirror` disk rule and the tmux conventions all apply here unchanged.
-
-```
-./deploy-llmd.sh low     # jump box   : preflight, stage the model images
-./deploy-llmd.sh high    # cluster    : verify, configure, deploy, test
-./deploy-llmd.sh list    # show phases
-```
+It assumes OpenShift and RHOAI are already installed and healthy. Building that
+underneath is a separate job:
+**[rh-aiservices-bu/disconnected-rhoai](https://github.com/rh-aiservices-bu/disconnected-rhoai)**.
 
 ---
 
-## Prerequisites, and where each one comes from
+## What gets deployed
 
-Red Hat's [llm-d prerequisites](https://docs.redhat.com/en/documentation/red_hat_ai_inference/3.4/html/deploy_distributed_inference_with_llm-d_on_openshift_container_platform/prerequisites-llmd-on-openshift_llmd-on-openshift)
-assume a connected cluster, where the `rhai-on-openshift` Helm chart pulls from
-`registry.redhat.io` and installs the missing pieces itself. That chart cannot
-run here, so each prerequisite has to be satisfied some other way.
+An `LLMInferenceService` — the RHOAI/KServe resource that runs a model under
+llm-d — plus the routing layer in front of it:
 
-| Prerequisite | Here |
+| Component | What it is |
 |:--|:--|
-| OpenShift 4.19+ | 4.20.30 ✓ — phase 05 checks |
-| GPU node pool | none by default — `scripts/12-gpu-machineset.sh` provisions an L40S |
-| NVIDIA GPU Operator | installed by CRIAB; the **driver build** is the hard part — see [GPU](#the-gpu-node) |
-| Gateway `openshift-ai-inference` in `openshift-ingress` | `manifests/gateway/` — but see [§3](#3-the-gateway-pulls-in-service-mesh-from-a-catalog-that-was-disabled) |
-| LeaderWorkerSet Operator | Helm would install it; here `scripts/16-install-lws.sh`, and it must be mirrored first |
-| Service Mesh v2 **absent** | phase 05 fails if it is present — it conflicts with the Sail operator |
-| LoadBalancer | AWS NLB, but it must be **internal** — phase 40 patches it |
-| User Workload Monitoring | phase 05 warns and prints the patch |
-| 50 GB per GPU node | MachineSet defaults to 200 GB; phase 05 checks the running node |
-| Model weights from a registry | no egress — ModelCar, see [§1](#1-model-weights-cannot-come-from-hugging-face) |
+| **vLLM server** | the model itself, one pod per replica, one GPU each |
+| **ModelCar sidecar** | the model weights, delivered as a container image |
+| **Inference scheduler (EPP)** | llm-d's endpoint picker — routes each request to the replica that already holds its prefix in KV cache, instead of round-robin |
+| **Routing sidecar + KV-cache** | the data path the scheduler steers |
+| **Gateway + HTTPRoute** | `openshift-ai-inference` in `openshift-ingress`, serving `/{namespace}/{model}/v1/...` |
+| **Namespace + HardwareProfile** | `demo-llm`, and the GPU shape the dashboard shows |
 
-**LeaderWorkerSet is optional for what this repo deploys by default.** The
-KServe controller calls `IsCrdAvailable` for `LeaderWorkerSet` and only watches
-it when the CRD exists; single-node replicas reconcile into a plain Deployment.
-It becomes required for multi-node — disaggregated prefill/decode, or a model
-too large for one node. Phase 05 warns rather than fails.
+The result is an OpenAI-compatible endpoint. Two models ship ready to use:
+`qwen2.5-0.5b` (small, for proving the path) and `qwen3-4b` (the demo model).
 
----
+## What gets mirrored
 
-## What changes when you go disconnected
+Eight images, about **27 GB**. Phase 05 discovers the exact list from your
+cluster and writes `config/required-images.txt` — the digests are specific to
+your RHOAI version, so this table is illustrative, not a fixed list.
 
-A connected llm-d deployment (see [rhaoi3-llm-d](../rhaoi3-llm-d)) is roughly
-"apply an `LLMInferenceService` and wait". Five things break without egress, and
-this repo exists to handle them.
+| Image | Size | Why |
+|:--|:--|:--|
+| `quay.io/redhat-ai-services/modelcar-catalog` *(qwen2.5-0.5b-instruct)* | 0.9 GiB | model weights, smoke test |
+| `quay.io/redhat-ai-services/modelcar-catalog` *(qwen3-4b)* | 7.6 GiB | model weights, demo |
+| `registry.redhat.io/rhaii/vllm-cuda-rhel9` | 16 GiB | the vLLM serving runtime |
+| `registry.redhat.io/rhoai/odh-llm-d-inference-scheduler-rhel9` | small | the endpoint picker |
+| `registry.redhat.io/rhoai/odh-llm-d-routing-sidecar-rhel9` | small | request routing |
+| `registry.redhat.io/rhoai/odh-llm-d-kv-cache-rhel9` | 4.4 GiB | KV-cache support |
+| `registry.redhat.io/rhoai/odh-kserve-storage-initializer-rhel9` | small | unpacks the ModelCar |
+| `registry.access.redhat.com/ubi9/httpd-24` | 250 MB | only for the [GPU driver workaround](#no-gpu) |
 
-### 1. Model weights cannot come from Hugging Face
+Three things worth knowing about that list:
 
-`uri: hf://Qwen/Qwen3-4B` makes the KServe storage-initializer reach
-`huggingface.co`. That host does not exist from this cluster, and the pod sits
-in `Init` until the timeout.
+- **The model weights are the reason this is not just an `oc apply`.** A normal
+  llm-d deployment fetches them from Hugging Face at runtime. Here they travel
+  as a container image (KServe *ModelCar*) through the same mirror as everything
+  else.
+- **The four llm-d components are usually missing even on a healthy cluster.**
+  Nothing pulls them until the first `LLMInferenceService` exists, so a RHOAI
+  install can report `Ready` for weeks with none of them mirrored. All four were
+  absent on the cluster this was built against.
+- **Only the accelerator you own is mirrored.** RHOAI also declares ROCm, Gaudi
+  and Spyre runtimes; phase 05 drops the ones your nodes cannot schedule, which
+  saves tens of gigabytes.
 
-The fix is **ModelCar**: the weights are packaged as an ordinary container image
-and referenced with `oci://`. They then travel the same mirror path as every
-other image, and `IDMS` redirects the pull to Quay exactly as it does for the
-vLLM runtime.
-
-```yaml
-# connected
-uri: hf://Qwen/Qwen3-4B
-
-# disconnected — manifests/qwen3-4b/llm-inference-service.yaml
-uri: oci://quay.io/redhat-ai-services/modelcar-catalog@sha256:2252a63e...
-```
-
-Note the manifest still names `quay.io`, not the mirror registry. That is the
-CRIAB convention and it matters: `IDMS` does the redirection, so the manifest
-stays portable instead of being welded to one lab.
-
-### 2. ModelCar is off by default
-
-KServe refuses `oci://` model URIs unless `enableModelcar` is true in the
-`inferenceservice-config` ConfigMap:
-
-```
-OCI modelcars is not enabled
-```
-
-That surfaces as a reconcile failure on the `LLMInferenceService`, not as
-anything image-shaped, which is what makes it expensive to diagnose.
-`scripts/30-enable-modelcar.sh` sets it and restarts the KServe controller —
-the controller caches this config at startup, so without the restart the patch
-reads as applied and does nothing.
-
-The same script **clears `uidModelcar`** if it is set. KServe applies that value
-as `runAsUser` on both the ModelCar sidecar and the main serving container, and
-OpenShift's `restricted-v2` SCC rejects any UID outside the namespace's assigned
-range. Unset is the only workable setting here.
-
-### 3. The Gateway pulls in Service Mesh, from a catalog that was disabled
-
-Creating a `GatewayClass` with controller
-`openshift.io/gateway-controller/v1` makes the cluster-ingress-operator create an
-OLM Subscription for `servicemeshoperator3` — from a CatalogSource named
-**`redhat-operators`** in `openshift-marketplace`, hard-coded.
-
-On a disconnected cluster that source was disabled along with the rest of the
-defaults. Nothing resolves, the GatewayClass stays `Accepted=Unknown` forever,
-the Gateway is never `Programmed`, and requests 404. Meanwhile the DSC still
-reports Ready, so nothing points at the actual problem.
-
-CRIAB handles this in its phase 30 by aliasing the *mirrored* index under the
-name `redhat-operators` when `INSTALL_SERVICE_MESH3=true`. This repo's preflight
-checks for that CatalogSource rather than assuming it, and phase 40 fails with
-the diagnosis rather than an anonymous timeout.
-
-### 4. Nothing may be assumed to be in the mirror
-
-`scripts/20-verify-mirror.sh` reads the images the *running cluster* says llm-d
-will pull — out of the `LLMInferenceServiceConfig` presets and the KServe config
-— and checks each one against Quay with `podman manifest inspect` before
-anything is deployed. Finding a gap here costs a minute; finding it after a
-7.6 GiB pull and a MachineConfig rollout costs an afternoon.
-
-Only the ModelCar images actually need adding to the mirror. The vLLM runtime,
-the endpoint picker, the storage initializer and the Istio proxy all arrive
-through the RHOAI and OSSM 3 operator bundles CRIAB already mirrors. Phase 20
-verifies that claim instead of trusting it.
-
-> **Watch the registry path for vLLM.** The runtime is published under
-> `registry.redhat.io/rhaii/vllm-cuda-rhel9` — one `i`, no trailing `s`. Several
-> upstream examples (including the connected reference repo) use `rhaiis/`,
-> which is not covered by the IDMS and fails only on a disconnected cluster.
-> [RHOAIENG-82814](https://redhat.atlassian.net/browse/RHOAIENG-82814). This
-> repo does not hard-code the runtime image — the KServe presets supply it — but
-> if you add your own `ServingRuntime`, check the path.
-
-### 5. The GPU node is the hardest part
-
-Big enough that it has [its own section](#the-gpu-node).
+Everything is pushed into its own `llmd` namespace in the mirror registry, with
+its own `ImageDigestMirrorSet`, so it cannot disturb rules another workload
+depends on.
 
 ---
 
-## The GPU node
+## The whole process
 
-Two separate jobs: get a GPU instance into the cluster, and get the NVIDIA
-driver to build on it without internet. The second is where the time goes.
-
-### Provisioning an L40S node
+Five commands. Roughly 45 minutes, most of it waiting for images to copy.
 
 ```bash
-./deploy-llmd.sh 12
+# 0. one-time
+cp config/llmd.env.example config/llmd.env     # usually needs no edits
+
+# 1. laptop — copy this repo to both lab hosts
+scripts/remote.sh sync
+
+# 2. high side — ask the cluster what it needs
+scripts/remote.sh run high -- './deploy-llmd.sh 05'
+
+# 3. laptop — carry that list to the low side
+scripts/remote.sh sync
+
+# 4. low side — download and ship the images       (~20 min)
+scripts/remote.sh run low  -- './deploy-llmd.sh low'
+
+# 5. high side — push, deploy, and prove it works  (~20 min)
+scripts/remote.sh run high -- './deploy-llmd.sh high'
 ```
 
-Every cluster-specific value — AMI, subnet, security group, IAM profile — is
-cloned from the existing worker MachineSet. Nothing is written down, because a
-stale AMI produces an instance that boots and never joins, and the only evidence
-is in the machine-controller log.
+Step 5 ends with a real inference request and prints the model's reply. If you
+see `llm-d verify complete`, you are done.
 
-L40S on AWS is the **g6e** family, 48 GB VRAM per GPU:
+> **Steps 4 and 5 are long.** Run them under `tmux` (`scripts/remote.sh ssh low`,
+> then `tmux new -s llmd`) so a dropped SSH connection cannot kill them. Every
+> phase is re-runnable, so if something does die, just run it again.
 
-| Type | GPUs | VRAM | Use |
-|:--|:--|:--|:--|
-| `g6e.2xlarge` | 1× L40S | 48 GB | default |
-| `g6e.12xlarge` | 4× L40S | 192 GB | 4 llm-d replicas |
-| `g5.2xlarge` | 1× A10G | 24 GB | fallback where g6e is not offered |
+### If a step fails
 
-The script checks `describe-instance-type-offerings` before applying, because
-g6e is not in every AZ and the failure otherwise is a Machine stuck in
-`Provisioning` with the reason buried in a controller log. It also prints the
-G-family vCPU quota command — a zero quota is the other silent failure, and it
-looks identical.
+Every phase prints what to do next. Re-run just that phase:
 
-It **spends money** and asks you to type the instance type to confirm.
+```bash
+./deploy-llmd.sh 18        # or whichever number failed
+```
 
-The `nvidia.com/gpu:NoSchedule` taint is **off by default**. It keeps cheap
-workloads off an expensive node, but every DaemonSet that must run there (NFD
-worker, the driver, the device plugin) has to tolerate it — and when one does
-not, the symptom is a GPU node reporting no capacity, which is indistinguishable
-from a driver failure. Turn it on with `GPU_TAINT=true` once the stack works.
+Nothing is destructive and nothing has to be undone first. Re-running a phase
+that already succeeded is a no-op.
 
-### Getting the driver to build
+---
 
-**Run the diagnosis first. Do not start building anything.**
+## Before you start
+
+| | |
+|:--|:--|
+| A disconnected cluster | OpenShift 4.19+, RHOAI 3.4+, `DataScienceCluster` Ready |
+| Built with | [disconnected-rhoai](https://github.com/rh-aiservices-bu/disconnected-rhoai) |
+| SSH to both hosts | jump box (has internet) and high side (has the registry and `oc`) |
+| A GPU with capacity | see [No GPU?](#no-gpu) |
+| Free disk | ~60 GB on `/mnt/mirror` per host, ~60 GB in the mirror registry |
+| A Red Hat pull secret | on the low side, for `registry.redhat.io` |
+
+Preflight checks all of this and changes nothing. **Run it first if unsure:**
+
+```bash
+scripts/remote.sh run high -- './deploy-llmd.sh 06'
+scripts/remote.sh run low  -- './deploy-llmd.sh 01'
+```
+
+### Configuration
+
+One file, `config/llmd.env`, and the defaults are usually right. The values you
+might change:
+
+```bash
+LLMD_MODEL="qwen2.5-0.5b"   # start here: 0.9 GiB, proves the whole path
+LLMD_MODEL="qwen3-4b"       # the demo model: 7.6 GiB
+
+LLMD_LOW_HOST="..."         # set these if your disconnected-rhoai checkout
+LLMD_HIGH_HOST="..."        # points at a different environment
+```
+
+Registry address, credentials and host addresses are read from the
+disconnected-rhoai checkout's own config file (it is named `config/criab.env`
+there) — deliberately not duplicated here, because two copies of
+`MIRROR_REGISTRY` is how you end up pushing to a registry the cluster does not
+trust. The scripts find that checkout automatically under `~/disconnected-rhoai`
+or `~/criab`; set `RHOAI_REPO_DIR` if yours lives elsewhere.
+
+---
+
+## What each phase does
+
+| Phase | Where | What |
+|:--|:--|:--|
+| `05` | high | Asks the cluster which images llm-d needs → `config/required-images.txt` |
+| `01` | low | Preflight |
+| `10` | low | Downloads them (`oc-mirror` to disk) |
+| `15` | low | Ships the archive to the high side, then **verifies the copy** |
+| `06` | high | Preflight — CRDs, GPU, disk, catalog, Service Mesh |
+| `18` | high | Pushes to the registry, merges mirror rules, waits for the rollout |
+| `20` | high | Confirms every required image is really there |
+| `30` | high | Enables OCI ModelCar in KServe |
+| `40` | high | Creates the Gateway and the model |
+| `50` | high | Sends a real completion request |
+
+Phase 05 is separate because only the high side can read the cluster and only
+the low side has internet. `scripts/remote.sh sync` moves the list between them.
+
+---
+
+## Why disconnected is different
+
+Four things break without egress. The scripts handle all of them; this is what
+they are doing.
+
+**1. Model weights cannot come from Hugging Face.** `uri: hf://Qwen/Qwen3-4B`
+reaches `huggingface.co`, which does not exist here. Instead the weights ship as
+a container image and are referenced with `oci://`.
+
+**2. ModelCar is off by default.** KServe rejects `oci://` URIs unless
+`enableModelcar` is set, and the error — `OCI modelcars is not enabled` — appears
+as a reconcile failure, not anything image-shaped. Phase 30 sets it and restarts
+the controller, which caches the value at startup.
+
+**3. The Gateway pulls in Service Mesh.** Creating a `GatewayClass` makes the
+ingress operator subscribe `servicemeshoperator3` from a CatalogSource named
+`redhat-operators` — hard-coded, and disabled on a disconnected cluster. Without
+an alias to the mirrored index the GatewayClass sits at `Accepted=Unknown`
+forever while the DataScienceCluster still reports Ready. The disconnected-rhoai
+install creates that alias; phase 06 checks for it.
+
+**4. Nothing may be assumed to be in the mirror.** Phase 20 checks every image
+against the registry before anything is deployed, using the cluster's own mirror
+rules rather than guessing the path.
+
+---
+
+## No GPU?
+
+llm-d needs a GPU. Phase 06 tells you which case you are in.
+
+**No GPU node at all** — provision one (this spends money, ~$2/hour):
+
+```bash
+./deploy-llmd.sh 12          # NVIDIA L40S on AWS (g6e.2xlarge)
+```
+
+**A GPU node exists but reports no capacity** — the driver did not build. This is
+the normal disconnected failure and it is *not* a hardware fault. Start with the
+diagnosis; it often reports that there is nothing to do:
 
 ```bash
 ./deploy-llmd.sh 14 diagnose
 ```
 
-The GPU operator compiles its kernel module on the node at runtime, and needs
-two things it normally downloads. They fail independently:
+Kernel sources come from the Driver Toolkit, which is in the OpenShift release
+payload and therefore already mirrored — that half usually works. CUDA packages
+come from `developer.download.nvidia.com` and that half usually does not.
+`diagnose` distinguishes them so you do not do an hour of unnecessary work.
 
-| Half | Where it comes from | Usually |
-|:--|:--|:--|
-| kernel-devel / kernel-headers | the Driver Toolkit image, which is **in the OCP release payload and therefore already mirrored** | fine |
-| CUDA development packages | `developer.download.nvidia.com` | **broken** |
-
-That asymmetry is the point. The kernel half is solved by OpenShift itself as
-long as the ClusterPolicy has `operator.use_ocp_driver_toolkit: true`, so the
-usual answer is that only the CUDA half needs work. `diagnose` reads the driver
-pod logs, matches the signatures that distinguish the two, and tells you which
-subcommands you actually need. Doing the kernel half when you did not need it
-costs an hour and changes nothing.
-
-It also checks NFD health, because a partial NFD upgrade leaves `nfd-master`
-not Ready on a missing `nodefeaturegroups` CRD, nothing gets labelled, and the
-result presents as a GPU problem rather than an NFD one.
-
-If the CUDA half is broken:
+**A GPU exists but something else is using it** — phase 06 names the holder. One
+GPU cannot run two models:
 
 ```bash
-# LOW side — the only host with internet
-./deploy-llmd.sh 14 fetch-cuda
-rsync -avP /mnt/mirror/cuda-rpms.tar.gz lab-user@$HIGH_IP:/mnt/mirror/
-
-# HIGH side
-tar -xzf /mnt/mirror/cuda-rpms.tar.gz -C /mnt/mirror/
-./deploy-llmd.sh 14 build-repo     # DTK kernel packages + CUDA -> repo image -> Quay
-./deploy-llmd.sh 14 deploy-repo    # run it in-cluster
-./deploy-llmd.sh 14 patch          # point the ClusterPolicy at it
-./deploy-llmd.sh 14 verify         # wait for nvidia.com/gpu capacity
-```
-
-`CUDA_VERSION` must match what the driver expects; `diagnose` prints how to read
-it off the ClusterPolicy.
-
-### Why the repo runs in-cluster
-
-The obvious fix is `python3 -m http.server` on the high side. It works, and it
-breaks the next time anything restarts.
-
-The driver pod runs `dnf install` **every time it starts** — node reboots,
-MachineSet scale-ups, operator upgrades, ClusterPolicy edits — not once at
-install. A background process on a jump host is not there for any of those, and
-when it is gone the GPU silently stops working. The MaaS guide's team hit this
-and filed [RHOAIENG-82815](https://redhat.atlassian.net/browse/RHOAIENG-82815)
-because there is no good upstream answer yet.
-
-So `build-repo` bakes the RPMs into an image, pushes it to Quay, and
-`deploy-repo` runs it as a Deployment in `nvidia-gpu-operator` with a Service at
-`http://gpu-kernel-repo.nvidia-gpu-operator.svc:8080/`. That survives everything
-the cluster does to itself, and it is reproducible from the mirror after a
-rebuild — which is the whole point of the environment.
-
-Pass `--bastion` to `build-repo` for the throwaway version when you just need
-the GPU working in the next ten minutes.
-
-The httpd base image must itself be mirrored. It is in
-`config/additional-images.txt` for that reason — mirror it in the same batch as
-the models, because discovering you need it later costs another full low→high
-round trip.
-
----
-
-## Setup
-
-```bash
-cp config/llmd.env.example config/llmd.env
-```
-
-The only value most people touch is `CRIAB_DIR` — and it self-detects `~/criab`
-and `~/projects/criab`, so usually nothing. Registry, credentials and host
-addresses are read from CRIAB's `config/criab.env`; they are deliberately not
-duplicated here, because two copies of `MIRROR_REGISTRY` is how you end up
-pushing to a registry the cluster does not trust.
-
-Sync to the lab hosts with CRIAB's `remote.sh`, pointing it at this repo:
-
-```bash
-cd ../criab
-REMOTE_DIR=/home/lab-user/disconnected-llm-d \
-  REPO_ROOT=$(cd ../disconnected-llm-d && pwd) scripts/remote.sh sync low
-```
-
-Or plainly:
-
-```bash
-rsync -az -e 'ssh -F ../criab/.ssh-config' --exclude .git \
-  ./ criab-low:/home/lab-user/disconnected-llm-d/
-rsync -az -e 'ssh -F ../criab/.ssh-config' --exclude .git \
-  ./ criab-high:/home/lab-user/disconnected-llm-d/
+oc patch llminferenceservice <other-model> -n <ns> --type=merge -p '{"spec":{"replicas":0}}'
 ```
 
 ---
 
-## Runbook
+## Using the model
 
-Start with `qwen2.5-0.5b`. It is 0.9 GiB against the 4B model's 7.6 GiB and
-exercises the identical path — mirror, ModelCar, vLLM, scheduler, Gateway,
-HTTPRoute. Prove the plumbing cheaply, then switch `LLMD_MODEL` to `qwen3-4b`.
-
-### Step 1 — low side: stage the model images
+llm-d routes by path — `/{namespace}/{name}/v1/...`:
 
 ```bash
-ssh -F ../criab/.ssh-config criab-low
-cd ~/disconnected-llm-d
-./deploy-llmd.sh low
+oc port-forward -n openshift-ingress \
+  svc/openshift-ai-inference-openshift-default 8080:80 &
+
+curl -s http://localhost:8080/demo-llm/qwen25-05b/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct",
+       "messages":[{"role":"user","content":"hello"}]}' | jq
 ```
 
-This checks the images are reachable, then appends their digest-pinned
-references to CRIAB's `config/additional-images.txt`. It does not mirror
-anything by itself; it prints the commands. Pass `--mirror` to phase 10 if you
-want it to run them.
+The `model` field must match `spec.model.name`, not the resource name. Phase 50
+reads it from `/v1/models` rather than assuming, because a mismatch returns a
+404 that looks exactly like a routing failure.
 
-### Step 2 — low side: run the mirror pipeline
-
-Long. Under `nohup` with a per-run log, per the CRIAB convention:
-
-```bash
-cd ~/criab
-nohup bash -c './deploy-rhoai.sh 10 && ./deploy-rhoai.sh 15' \
-  > /mnt/mirror/llmd-mirror.log 2>&1 &
-```
-
-Chained with `&&`, not two background jobs — phase 15 rsyncs the archive phase
-10 produces.
-
-Judge progress by the artifact growing, never by process liveness:
-
-```bash
-f=/mnt/mirror/criab-mirror/mirror_seq1.tar
-a=$(stat -c %s $f); sleep 30; b=$(stat -c %s $f)
-echo "$(( (b-a)/1048576 )) MB in 30s"
-```
-
-### Step 3 — high side: push into Quay
-
-```bash
-ssh -F ../criab/.ssh-config criab-high
-cd ~/criab && nohup ./deploy-rhoai.sh 20 > /mnt/mirror/llmd-push.log 2>&1 &
-```
-
-### Step 3b — high side: one-time cluster setup
-
-Only needed once per environment, and deliberately **not** part of
-`./deploy-llmd.sh high` — provisioning a node spends money and takes 15 minutes,
-and the driver work has to be read rather than automated past.
-
-```bash
-./deploy-llmd.sh 12                # GPU node (skip if one already works)
-./deploy-llmd.sh 14 diagnose       # then follow what it tells you
-./deploy-llmd.sh 16                # LeaderWorkerSet — optional for single-node
-```
-
-### Step 4 — high side: deploy
-
-```bash
-cd ~/disconnected-llm-d
-source ~/criab/scripts/ocp/oc-login.sh      # source it, do not execute it
-tmux new -s llmd
-./deploy-llmd.sh high 2>&1 | tee /mnt/mirror/llmd.log
-```
-
-Detach with `Ctrl-b d`; reattach with `tmux attach -t llmd`. Check on it without
-attaching:
-
-```bash
-tail -40 /mnt/mirror/llmd.log
-tmux capture-pane -pt llmd -S -60
-```
-
-Phase 40 prints `llm-d deploy complete` and phase 50 prints
-`llm-d verify complete`. Poll for those markers rather than guessing from
-process state.
-
-### Step 5 — scale up to the demo model
+To switch to the 4B demo model:
 
 ```bash
 sed -i 's/^LLMD_MODEL=.*/LLMD_MODEL="qwen3-4b"/' config/llmd.env
-sed -i 's/^LLMD_REPLICAS=.*/LLMD_REPLICAS="4"/' config/llmd.env   # needs 4 GPUs
 ./deploy-llmd.sh 40 && ./deploy-llmd.sh 50
 ```
 
-`prefix-cache-scorer` — the whole point of llm-d over plain vLLM — is inert at
-one replica. It only does anything once there is more than one replica for it to
-choose between, so the routing benefit does not appear until you scale.
+`prefix-cache-scorer` — the thing that makes llm-d better than plain vLLM — is
+inert at one replica. The routing benefit only appears once there is more than
+one replica to choose between.
 
 ---
 
-## Phases
+## Troubleshooting
 
-| | | |
-|:--|:--|:--|
-| `00` | low | preflight — images reachable, CRIAB config found, disk free |
-| `10` | low | append ModelCar + httpd refs to CRIAB's mirror list |
-| `05` | high | preflight — version, CRDs, ModelCar config, catalog, LWS, OSSM v2, UWM, GPU, storage, IDMS |
-| `20` | high | verify every required image is in Quay |
-| `30` | high | enable `enableModelcar`, clear `uidModelcar`, restart controller |
-| `40` | high | Gateway (+ internal NLB), namespace, `LLMInferenceService`; wait |
-| `50` | high | port-forward the Gateway and send a real completion request |
-| `90` | high | teardown (`--all` also removes namespace and Gateway) |
+Ordered by how often each is the answer.
 
-One-time cluster setup, run separately:
+| Symptom | What it means |
+|:--|:--|
+| Phase fails with advice printed | do what it says, then re-run that phase |
+| `ImagePullBackOff` | run phase 20 — it names the missing image |
+| Pod `Pending`, `Insufficient nvidia.com/gpu` | something else holds the GPU; phase 06 names it |
+| GPU node with no capacity | driver did not build → `./deploy-llmd.sh 14 diagnose` |
+| oc-mirror push → `502 Bad Gateway` | the registry's disk is full; phase 18 checks this first and tells you how to reclaim |
+| `manifest unknown` from `localhost:55000` | usually an empty incremental archive, not corruption — run phase 20; if all images are present there is nothing to do |
+| An image was mirrored but now reports `NORULE` | an IDMS was replaced rather than merged; re-run phase 18, which unions rules |
+| GatewayClass `Accepted=Unknown` | no `redhat-operators` CatalogSource — re-run the disconnected-rhoai install's phase 30 |
+| Gateway programmed but times out | external NLB with public IPs; phase 40 patches this automatically |
+| `OCI modelcars is not enabled` | phase 30 not run, or the controller was not restarted |
+| Scheduler logs show Hugging Face fetches | drop `prefix-cache-scorer` from the plugin list; the other scorers need no tokenizer |
 
-| | | |
-|:--|:--|:--|
-| `12` | high | GPU MachineSet — L40S/g6e (`--show`, `--delete`) |
-| `14` | both | GPU driver: `diagnose`, `fetch-cuda`, `build-repo`, `deploy-repo`, `patch`, `verify` |
-| `16` | high | LeaderWorkerSet Operator (`--check`) |
+Quick health check:
 
-Every phase is runnable on its own: `./deploy-llmd.sh 40`. All of them accept
-`DRY_RUN=true`.
+```bash
+oc get llminferenceservice -n demo-llm
+oc get pods -n demo-llm
+oc logs -n demo-llm -l app.kubernetes.io/name=<model> -c main --tail=50
+```
 
 ---
 
 ## Layout
 
 ```
-deploy-llmd.sh              phase driver
+deploy-llmd.sh              phase driver — start here
+scripts/
+  remote.sh                 sync the repo to the lab hosts
+  00-preflight.sh           low|high checks; changes nothing
+  05-discover-images.sh     ask the cluster what it needs
+  10-mirror-images.sh       oc-mirror to disk
+  15-transfer.sh            ship it, then verify the copy
+  18-push-images.sh         push to the registry + mirror rules + rollout
+  20-verify-mirror.sh       confirm everything is really there
+  30-enable-modelcar.sh     enable oci:// in KServe
+  40-deploy.sh              Gateway + model
+  50-verify.sh              real inference request
+  12/14/16-*.sh             GPU node, GPU driver, LeaderWorkerSet
+  90-teardown.sh
 config/
   llmd.env.example          the only file you edit
-  additional-images.txt     what this project adds to the mirror, and why
-  imageset-config-llmd.yaml oc-mirror config for the LeaderWorkerSet operator
+  required-images.txt       generated by phase 05
 manifests/
-  base/                     namespace + gpu-profile HardwareProfile
-  gateway/                  GatewayClass + Gateway
-  gpu/
-    machineset-l40s.yaml    g6e MachineSet template (envsubst)
-    kernel-repo.yaml        in-cluster kernel/CUDA package repo
-  qwen2.5-0.5b/             smoke-test model, 0.9 GiB, 1 GPU
-  qwen3-4b/                 demo model, 7.6 GiB, 1 GPU per replica
-scripts/
-  lib/common.sh             logging, config loading, mirror checks
-  00-preflight.sh  10-stage-images.sh  20-verify-mirror.sh
-  12-gpu-machineset.sh  14-gpu-driver-disconnected.sh  16-install-lws.sh
-  30-enable-modelcar.sh  40-deploy.sh  50-verify.sh  90-teardown.sh
+  base/ gateway/ gpu/       namespace, HardwareProfile, Gateway, MachineSet
+  qwen2.5-0.5b/ qwen3-4b/   the models
 ```
 
-The manifests stand alone if you would rather not use the scripts:
-
-```bash
-oc apply -f manifests/gateway/gateway.yaml
-oc apply -k manifests/qwen2.5-0.5b
-```
-
-You still need phase 30 first, or the `oci://` URI is rejected.
+The manifests work standalone (`oc apply -k manifests/qwen2.5-0.5b`) — but phase
+30 must have run first, or the `oci://` URI is rejected.
 
 ---
 
-## Calling the model
+## Field notes
 
-llm-d routes by path — `/{namespace}/{name}/v1/...` — so the namespace and the
-`LLMInferenceService` name are both part of the URL.
+Every one of these was hit bringing this up on a real cluster. They are all
+handled by the scripts now; they are recorded because the symptom never
+resembles the cause.
 
-In-cluster:
+**`oc apply` on an IDMS replaces it — it does not merge.** The sharpest edge in
+the whole process, and it bites in two ways. *Across projects:* regenerating the
+RHOAI install's mirror config produces objects named `idms-operator-0` /
+`idms-generic-0`, and applying a narrower set silently deletes rules other
+workloads rely on. *Against yourself:* oc-mirror regenerates those files from
+whatever was in the **current** archive, so on an incremental run applying them
+deletes the rules for everything mirrored earlier. That happened here — the
+ModelCar rule vanished hours after a successful mirror and the images reported
+"no mirror rule" while sitting in the registry. Phase 18 now **unions** rules
+keyed by source; they only accumulate.
 
-```
-http://openshift-ai-inference-openshift-default.openshift-ingress.svc.cluster.local/demo-llm/qwen3-4b/v1
-```
-
-From the high side:
-
-```bash
-oc port-forward -n openshift-ingress svc/openshift-ai-inference-openshift-default 8080:80 &
-
-curl -s http://localhost:8080/demo-llm/qwen3-4b/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"Qwen/Qwen3-4B","messages":[{"role":"user","content":"hello"}]}' | jq
-```
-
-The `model` field must match `spec.model.name`, not the resource name. Phase 50
-reads it from `/v1/models` rather than assuming, because a mismatch returns a
-404 that reads exactly like a routing failure.
-
----
-
-## When it does not work
-
-Work down this list; it is ordered by how often each one is the answer.
-
-| Symptom | Cause |
-|:--|:--|
-| `ImagePullBackOff` on the ModelCar | not mirrored — run phase 20, it says which |
-| Pod `Pending`, no node matches | no `nvidia.com/gpu` capacity; run `14 diagnose` |
-| GPU node exists, no `nvidia.com/gpu` | driver did not build — `14 diagnose`, almost always the CUDA half |
-| Machine stuck `Provisioning` | g6e not offered in the AZ, or G-family vCPU quota is 0 |
-| `nfd-master` not Ready | partial NFD upgrade, missing `nodefeaturegroups` CRD — nothing gets labelled |
-| GPU works, then stops after a reboot | the kernel repo was served from a shell, not in-cluster |
-| `OCI modelcars is not enabled` | phase 30 not run, or controller not restarted |
-| Sidecar `CreateContainerError` | `uidModelcar` is set; phase 30 clears it |
-| GatewayClass `Accepted=Unknown` | no `redhat-operators` CatalogSource — see §3 |
-| Gateway programmed, but times out / EOF | external NLB with public IPs; phase 40 patches to internal |
-| Gateway programmed, requests 404 | wrong path, or `model` field ≠ `spec.model.name` |
-| `manifest unknown` on a vLLM image | `rhaiis/` instead of `rhaii/` — RHOAIENG-82814 |
-| Scheduler logs show HF fetch attempts | drop `prefix-cache-scorer` from the plugin list and re-apply; the other two scorers need no tokenizer |
-
-An `x509` or `manifest unknown` error means the image was never mirrored.
-`pull QPS exceeded` is kubelet throttling and clears on its own.
-
-Before blaming the cluster:
+**oc-mirror archives are incremental against the LOW side's history, not the
+destination registry.** Re-run phase 10 after a successful push and you get a
+near-empty delta archive; feeding that to `diskToMirror` fails with
+`manifest unknown ... localhost:55000`, which reads as corruption but means
+"nothing new in the box". Phase 18 checks the registry first and skips the push
+when everything is already there. To force a full archive:
 
 ```bash
-oc get llminferenceservice -n demo-llm -o yaml | yq '.items[].status'
-oc get pods -n demo-llm
-oc logs -n demo-llm -l app.kubernetes.io/part-of=qwen3-4b -c main --tail=100
-oc get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.capacity.nvidia\.com/gpu
-df -h / /mnt/mirror
+rm -rf /mnt/mirror/llmd-mirror/working-dir && ./deploy-llmd.sh 10
 ```
+
+**`rsync --append` corrupts a regenerated archive.** It is only safe when
+resuming an *interrupted* copy of an *unchanged* file. Every incremental
+oc-mirror run rebuilds the tarball, so `--append` keeps the stale prefix and
+bolts a new tail on: right size, wrong content. The transfer reports success and
+the error surfaces two steps later. Phase 15 uses `--partial` and verifies a
+prefix hash on both sides.
+
+**A full registry looks like `502`, not a disk error.** The real cause
+(`ENOSPC`) is only inside the container log. Orphaned partial uploads under
+`<storage>/uploads` are never committed and are safe to delete when no push is
+running — 213 GiB was reclaimed that way. Phase 18 checks free space first.
+
+**A cached image is not a mirrored image.** The vLLM CUDA runtime was running
+happily from a node's local CRI-O cache while absent from the mirror entirely.
+It survives reboots but not node replacement.
+
+**Two inspection tools, opposite blind spots.** `podman manifest inspect` refuses
+single-arch images; `oc image info` refuses manifest lists without
+`--filter-by-os`. ModelCars are single-arch and the RHOAI components are lists,
+so either tool alone is wrong about half of them.
+
+**Kuadrant attaches an AuthPolicy to llm-d routes.** Where Models-as-a-Service is
+deployed, the generated HTTPRoute picks up `openshift-ai-inference-authn`. It is
+also why route status must be read across all `parents`, not `parents[0]`.
 
 ---
 
 ## References
 
-- [CRIAB cheatsheet](../criab/CHEATSHEET.md) — SSH topology, mirror pipeline, disk rules
-- [rhoai-maas-guide, Phase 0: Disconnected Setup](https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/content/modules/ROOT/pages/00-disconnected.adoc)
-  — where the GPU driver approach, the `rhaii/` path and the internal-NLB patch come from
+- [disconnected-rhoai](https://github.com/rh-aiservices-bu/disconnected-rhoai) — builds the cluster this deploys onto
+- [rhoai-maas-guide, Phase 0: Disconnected](https://github.com/rh-aiservices-bu/rhoai-maas-guide/blob/main/content/modules/ROOT/pages/00-disconnected.adoc) — GPU driver approach and the `rhaii/` registry path
 - [Red Hat AI Inference 3.4 — llm-d prerequisites](https://docs.redhat.com/en/documentation/red_hat_ai_inference/3.4/html/deploy_distributed_inference_with_llm-d_on_openshift_container_platform/prerequisites-llmd-on-openshift_llmd-on-openshift)
 - [LeaderWorkerSet Operator](https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html/ai_workloads/leader-worker-set-operator)
-- [rhaoi3-llm-d](../rhaoi3-llm-d) — the connected version this adapts
-
----
-
-## Things deliberately not done
-
-- **No Grafana/Prometheus stack.** The reference repo ships one using
-  `grafana/grafana:latest` and `prom/prometheus:v2.45.0` from Docker Hub —
-  unmirrored, and floating tags at that. The namespace carries
-  `openshift.io/cluster-monitoring: "true"`, so vLLM metrics land in the
-  in-cluster Prometheus. Mirror the dashboards separately if you want them.
-- **No benchmark jobs.** `guidellm` and the multi-turn benchmark pull from
-  `ghcr.io` and `quay.io/hayesphilip`, and the guidellm job also downloads a
-  tokenizer from Hugging Face at runtime. Both need real work to run
-  disconnected — a separate exercise from getting llm-d serving.
-- **No mirror deletion in teardown.** Removing images from Quay breaks node
-  reboot, scale and upgrade for every project on the cluster.
-- **PVC-backed weights.** `pvc://` is supported by KServe and is the alternative
-  to ModelCar. It needs a populated PVC, which means a transfer job and an RWX
-  volume, and it is not reproducible from the mirror after a rebuild. ModelCar
-  rides the pipeline that already exists.

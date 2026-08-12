@@ -11,7 +11,7 @@
 # Two sets are checked:
 #
 #   1. The ModelCar images this project adds. If these are missing, phase 10
-#      did not complete or phase 20 of the CRIAB pipeline was never run.
+#      did not complete or phase 20 of the RHOAI mirror pipeline was never run.
 #
 #   2. The images the RUNNING cluster says llm-d will use — read out of the
 #      LLMInferenceServiceConfig presets and the KServe config, not guessed.
@@ -66,10 +66,21 @@ verify() {
 }
 
 # ---------------------------------------------------------------------------
-step "1/2  ModelCar images added by this project"
+step "1/2  Images this deployment requires"
 
-verify "$MODELCAR_QWEN25_05B" "$MODELCAR_QWEN25_05B_TAG"
-verify "$MODELCAR_QWEN3_4B"   "$MODELCAR_QWEN3_4B_TAG"
+# Same file phase 10 mirrored from — one source of truth, so this cannot drift
+# from what was actually pushed.
+LIST="${REPO_ROOT}/config/required-images.txt"
+if [[ -f "$LIST" ]]; then
+  while read -r img; do
+    [[ -n "$img" ]] || continue
+    verify "$img"
+  done < <(grep -vE '^\s*#|^\s*$' "$LIST")
+else
+  warn "no config/required-images.txt — falling back to the configured ModelCars"
+  verify "$MODELCAR_QWEN25_05B" "$MODELCAR_QWEN25_05B_TAG"
+  verify "$MODELCAR_QWEN3_4B"   "$MODELCAR_QWEN3_4B_TAG"
+fi
 
 # ---------------------------------------------------------------------------
 step "2/2  Images the cluster says llm-d will pull"
@@ -134,7 +145,7 @@ if (( ${#MISSING[@]} > 0 )); then
 
   Add them on the LOW side and re-run the pipeline:
 
-    cd ${CRIAB_DIR:-~/criab}
+    cd ${RHOAI_REPO_DIR:-<disconnected-rhoai>}
     printf '%s\n' ${MISSING[*]@Q} >> config/additional-images.txt
     ./deploy-rhoai.sh 10 && ./deploy-rhoai.sh 15
     # then, back on the high side:

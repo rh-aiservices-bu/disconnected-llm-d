@@ -20,7 +20,7 @@
 # Install it anyway if you have the mirror capacity. It is small, and finding
 # out it is missing halfway through a multi-node experiment is worse.
 #
-# PREREQUISITE: the operator must be in the mirrored catalog. CRIAB's RHOAI
+# PREREQUISITE: the operator must be in the mirrored catalog. the RHOAI
 # batch does not include it — see config/imageset-config-llmd.yaml.
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
@@ -67,7 +67,7 @@ else
 
 $(printf '%s fail%s' "$C_RED" "$C_RST") package '${LWS_PKG}' is not in any CatalogSource on this cluster.
 
-  It is not part of CRIAB's RHOAI mirror batch. Mirror it with the config in
+  It is not part of the RHOAI mirror batch. Mirror it with the config in
   this repo, from the LOW side:
 
     export WORKDIR=/mnt/mirror/llmd-mirror
@@ -99,7 +99,7 @@ if oc get crd certificates.cert-manager.io >/dev/null 2>&1; then
   ok "cert-manager present"
 else
   die "cert-manager is not installed — LWS depends on it.
-     CRIAB installs it when INSTALL_CERT_MANAGER=true."
+     the RHOAI install installs it when INSTALL_CERT_MANAGER=true."
 fi
 
 # ---------------------------------------------------------------------------

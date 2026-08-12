@@ -1,4 +1,4 @@
-# ImageSetConfiguration for the operators llm-d needs that CRIAB's RHOAI batch
+# ImageSetConfiguration for the operators llm-d needs that the RHOAI batch
 # does not already carry.
 #
 # Right now that is one: the Leader Worker Set Operator. It is small, so this
@@ -54,7 +54,7 @@ mirror:
           channels:
             - name: stable
 
-        # LWS requires cert-manager. It is already installed by CRIAB, but a
+        # LWS requires cert-manager. It is already installed by the RHOAI install, but a
         # regenerated index missing it would leave OLM unable to resolve the
         # dependency on any future reinstall.
         - name: openshift-cert-manager-operator

@@ -24,7 +24,7 @@ step "Phase 00 — preflight (${SIDE} side)"
 # ---------------------------------------------------------------------------
 if [[ "$SIDE" == "low" ]]; then
 
-  # skopeo is not installed on the CRIAB jump box; podman always is. See
+  # skopeo is not installed on the jump box; podman always is. See
   # inspect_remote() in lib/common.sh.
   require_cmd oc jq
   check "image inspection via $(command -v skopeo >/dev/null 2>&1 && echo skopeo || echo '`oc image info` (no skopeo installed)')"
@@ -38,29 +38,65 @@ if [[ "$SIDE" == "low" ]]; then
     fi
   done
 
-  if [[ -f "$CRIAB_ENV" ]]; then
-    check "CRIAB env found at ${CRIAB_ENV}"
+  if [[ -f "$RHOAI_REPO_ENV" ]]; then
+    check "RHOAI install config found at ${RHOAI_REPO_ENV}"
   else
-    fail "no CRIAB env at ${CRIAB_ENV} — set CRIAB_DIR in config/llmd.env"
+    fail "no disconnected-RHOAI config at ${RHOAI_REPO_ENV} — set RHOAI_REPO_DIR in config/llmd.env"
   fi
 
-  add_file="${CRIAB_DIR}/config/additional-images.txt"
-  if [[ -w "$add_file" ]]; then
-    check "CRIAB additional-images.txt is writable"
+  # The image list is produced on the high side (only host that can read the
+  # cluster) and consumed here (only host with internet). Without it phase 10
+  # has nothing to mirror.
+  if [[ -f "${REPO_ROOT}/config/required-images.txt" ]]; then
+    n="$(grep -cvE '^\s*#|^\s*$' "${REPO_ROOT}/config/required-images.txt" || true)"
+    check "config/required-images.txt present (${n} images)"
   else
-    fail "cannot write ${add_file} — phase 10 appends the ModelCar refs there"
+    fail "no config/required-images.txt. Generate it on the HIGH side and carry
+       it here:
+         high side:  ./deploy-llmd.sh 05
+         laptop:     scripts/remote.sh sync"
+  fi
+
+  require_cmd oc-mirror >/dev/null 2>&1 \
+    && check "oc-mirror present" \
+    || fail "oc-mirror is not installed — phase 10 needs it"
+
+  if [[ -r "${RH_PULL_SECRET_FILE:-${HOME}/pull-secret.json}" ]]; then
+    check "Red Hat pull secret readable"
+  else
+    fail "no pull secret at ${RH_PULL_SECRET_FILE:-${HOME}/pull-secret.json} —
+       registry.redhat.io images (the llm-d components) cannot be pulled.
+       Set RH_PULL_SECRET_FILE in config/llmd.env if it lives elsewhere."
   fi
 
   # The mirror pipeline stages a full copy of everything before pushing. The
   # cheatsheet's rule of thumb is 3x payload free; 7.6 + 0.9 GiB of ModelCar
   # means ~26 GiB, and it shares /mnt/mirror with the RHOAI archive.
-  avail="$(df -BG --output=avail /mnt/mirror 2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+  # oc-mirror keeps a cache AND writes an archive, so budget well above the sum
+  # of the image sizes.
+  wd="${LLMD_WORKDIR%/*}"
+  avail="$(df -BG --output=avail "${wd:-/mnt/mirror}" 2>/dev/null | tail -1 | tr -dc '0-9' || true)"
   if [[ -z "$avail" ]]; then
-    warn "could not read free space on /mnt/mirror — is this actually the low side?"
-  elif (( avail >= 40 )); then
-    check "/mnt/mirror has ${avail}G free"
+    warn "could not read free space on ${wd:-/mnt/mirror} — is this actually the low side?"
+  elif (( avail >= 60 )); then
+    check "${wd:-/mnt/mirror} has ${avail}G free"
   else
-    fail "/mnt/mirror has only ${avail}G free — want 40G+ for the ModelCar images"
+    fail "${wd:-/mnt/mirror} has only ${avail}G free — want 60G+ for the archive and oc-mirror cache"
+  fi
+
+  # oc-mirror's cache defaults to $HOME/.oc-mirror, which is usually on /.
+  # Filling / takes the host off the network entirely — with no space for a DHCP
+  # lease the host reboots without an IP and is only reachable via the serial
+  # console. This has happened on this lab.
+  root_avail="$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9' || true)"
+  if [[ -n "$root_avail" ]]; then
+    if (( root_avail >= 40 )); then
+      check "/ has ${root_avail}G free (oc-mirror caches under \$HOME)"
+    else
+      fail "/ has only ${root_avail}G free. oc-mirror caches under \$HOME/.oc-mirror,
+       and filling / takes this host off the network entirely. Clear the cache:
+         rm -rf ~/.oc-mirror/.cache"
+    fi
   fi
 
 # ---------------------------------------------------------------------------
@@ -138,10 +174,10 @@ else
     fi
   else
     fail "no CatalogSource named redhat-operators in openshift-marketplace.
-       On a disconnected cluster the default source is disabled, so CRIAB
+       On a disconnected cluster the default source is disabled, so the RHOAI install
        aliases the MIRRORED index under that name (phase 30, gated on
        INSTALL_SERVICE_MESH3=true). Without it the Gateway never programs.
-       Re-run:  ~/criab/deploy-rhoai.sh 30"
+       Re-run its phase 30:  ./deploy-rhoai.sh 30"
   fi
 
   # Capture, then match. See imatch() in lib/common.sh for why a `| grep -q`
@@ -222,10 +258,18 @@ else
     # Pending pod — including the one this very deployment may have left behind
     # from a previous attempt — is competing for a GPU, not holding one, and
     # counting it produces nonsense like "-1 of 1 GPU(s) free".
-    gpus_used="$(oc get pods -A -o json | jq '
+    # Exclude pods belonging to the model THIS run deploys. Re-running the
+    # high-side phases against an already-deployed cluster must not fail just
+    # because our own model is holding the GPU it will keep holding.
+    own_isvc="$(model_isvc_name 2>/dev/null || echo '')"
+    gpus_used="$(oc get pods -A -o json | jq \
+      --arg ns "${LLMD_NAMESPACE:-}" --arg name "${own_isvc}" '
       [ .items[]
         | select(.spec.nodeName != null)
         | select(.status.phase == "Running" or .status.phase == "Pending")
+        | select( ($name == "") or
+                  (.metadata.namespace != $ns) or
+                  ((.metadata.labels["app.kubernetes.io/name"] // "") != $name) )
         | .spec.containers[]?.resources.requests["nvidia.com/gpu"] // "0" | tonumber
       ] | add // 0')"
     gpus_free=$(( gpus - gpus_used ))
@@ -301,7 +345,7 @@ $(oc get pods -A -o json | jq -r '
     fi
   else
     warn "cannot locate the mirror registry's storage volume."
-    warn "  Set MIRROR_REGISTRY_QUAY_STORAGE in ${CRIAB_ENV} so this can be checked;"
+    warn "  Set MIRROR_REGISTRY_QUAY_STORAGE in ${RHOAI_REPO_ENV} so this can be checked;"
     warn "  a full Quay volume presents as 502 on push, not as a disk error."
   fi
 
@@ -320,7 +364,7 @@ $(oc get pods -A -o json | jq -r '
   else
     fail "no ImageDigestMirrorSet or ImageContentSourcePolicy. Manifests use
        original image references and rely on mirror redirection; without it
-       every pull goes to quay.io and hangs. Run: ~/criab/deploy-rhoai.sh 30"
+       every pull goes to quay.io and hangs. Run the RHOAI install phase 30."
   fi
 fi
 
