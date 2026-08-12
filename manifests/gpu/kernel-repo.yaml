@@ -1,0 +1,88 @@
+# Serves the kernel + CUDA yum repo to the NVIDIA driver DaemonSet.
+#
+# Rendered and applied by scripts/14-gpu-driver-disconnected.sh deploy-repo,
+# which substitutes ${KERNEL_REPO_IMAGE} and ${GPU_NS}.
+#
+# This exists because the NVIDIA driver pod runs `dnf install` every time it
+# starts — node reboot, MachineSet scale-up, operator upgrade, ClusterPolicy
+# edit — not just once. A repo served from a shell on a jump host is gone by the
+# second of those, and the GPU silently stops working. Running it in-cluster,
+# from an image in the mirror, makes it survive everything the cluster does to
+# itself and reproducible after an environment rebuild.
+#
+# It lives in the GPU operator's own namespace so it shares that namespace's
+# lifecycle: if someone removes the GPU operator, this goes with it rather than
+# lingering as an orphan nobody recognises.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpu-kernel-repo
+  namespace: ${GPU_NS}
+  labels:
+    app: gpu-kernel-repo
+  annotations:
+    openshift.io/display-name: Disconnected kernel/CUDA package repo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gpu-kernel-repo
+  template:
+    metadata:
+      labels:
+        app: gpu-kernel-repo
+    spec:
+      # Must tolerate the GPU taint if one is set — otherwise on a single-GPU
+      # cluster there may be nowhere else to run, and the driver would be
+      # waiting on a repo that cannot schedule.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: httpd
+          image: ${KERNEL_REPO_IMAGE}
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /repodata/repomd.xml
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /repodata/repomd.xml
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-kernel-repo
+  namespace: ${GPU_NS}
+  labels:
+    app: gpu-kernel-repo
+spec:
+  selector:
+    app: gpu-kernel-repo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

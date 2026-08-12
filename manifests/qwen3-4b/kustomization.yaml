@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# No `namespace:` field on purpose. It would rewrite EVERY resource, including
+# the HardwareProfile, which must stay in redhat-ods-applications for the
+# dashboard to find it. Each resource carries its own namespace instead.
+
+resources:
+  - ../base
+  - llm-inference-service.yaml

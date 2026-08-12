@@ -1,0 +1,42 @@
+# Gateway API front door for llm-d.
+#
+# DISCONNECTED NOTE — this is the part that surprises people.
+#
+# Creating a GatewayClass with controllerName openshift.io/gateway-controller/v1
+# makes the cluster-ingress-operator create an OLM Subscription for
+# servicemeshoperator3, from CatalogSource "redhat-operators" in
+# openshift-marketplace. On a disconnected cluster the real redhat-operators
+# source has been disabled, so unless something provides a CatalogSource under
+# that exact name serving the MIRRORED index, the GatewayClass sits at
+# ACCEPTED=Unknown forever and the Gateway is never PROGRAMMED.
+#
+# CRIAB already handles this: phase 30 aliases the mirrored index under the name
+# redhat-operators when INSTALL_SERVICE_MESH3=true. scripts/00-preflight.sh
+# checks for it rather than assuming.
+#
+# The ingress operator does expose override annotations for the catalog, channel
+# and version (unsupported.do-not-use.openshift.io/ossm-catalog and friends).
+# They are documented as developer-only and only take effect when the
+# GatewayClass is FIRST created, so the alias CatalogSource is the more robust
+# route and the one used here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: openshift-default
+spec:
+  controllerName: openshift.io/gateway-controller/v1
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openshift-ai-inference
+  namespace: openshift-ingress
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: All

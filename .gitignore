@@ -1,0 +1,9 @@
+# Holds no secrets itself, but points at CRIAB's config, which does.
+config/llmd.env
+config/llmd.env.resolved
+
+# Throwaway registry auth written by scripts/lib/common.sh:mirror_login
+.llmd-auth.json
+
+*.log
+.claude/settings.json

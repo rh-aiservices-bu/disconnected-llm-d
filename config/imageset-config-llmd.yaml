@@ -1,0 +1,63 @@
+# ImageSetConfiguration for the operators llm-d needs that CRIAB's RHOAI batch
+# does not already carry.
+#
+# Right now that is one: the Leader Worker Set Operator. It is small, so this
+# runs as its own oc-mirror batch rather than re-walking the ~300 GB RHOAI set.
+#
+#   LOW SIDE
+#     export WORKDIR=/mnt/mirror/llmd-mirror
+#     oc-mirror --v2 --config config/imageset-config-llmd.yaml file://${WORKDIR}
+#     rsync -avP --append ${WORKDIR}/ lab-user@<HIGH_IP>:/mnt/mirror/llmd-mirror/
+#
+#   HIGH SIDE
+#     oc-mirror --v2 --from /mnt/mirror/llmd-mirror \
+#       docker://<MIRROR_REGISTRY>/<namespace>
+#
+# scripts/16-install-lws.sh prints these with your values filled in.
+#
+# AFTERWARDS the mirrored catalog index has changed, so the CatalogSource
+# aliased as redhat-operators must be repointed at the new index or OLM will
+# not see the new package:
+#
+#   NEW=$(awk '/image:/{print $2; exit}' \
+#     /mnt/mirror/llmd-mirror/working-dir/cluster-resources/cs-redhat-operator-index-*.yaml)
+#   oc patch catalogsource redhat-operators -n openshift-marketplace \
+#     --type=merge -p "{\"spec\":{\"image\":\"${NEW}\"}}"
+#
+# That alias is the same one the Gateway depends on for servicemeshoperator3 —
+# repointing it at an index that no longer carries OSSM 3 would break the
+# Gateway. This config therefore lists BOTH packages, so the regenerated index
+# is a superset rather than a replacement.
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  operators:
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.20
+      packages:
+        # Distributed inference coordination. Required for multi-node
+        # (prefill/decode disaggregated) serving; optional for the single-node
+        # replicas this repo deploys by default — the KServe controller checks
+        # whether the CRD exists and only watches it when it does.
+        #
+        # Red Hat lists it as an llm-d prerequisite because the connected path
+        # installs it automatically through the Helm chart, which cannot reach
+        # registry.redhat.io from here.
+        - name: leader-worker-set
+          defaultChannel: stable-v1.0
+          channels:
+            - name: stable-v1.0
+
+        # Kept so the regenerated index still carries what the cluster already
+        # depends on. See the note above about the redhat-operators alias.
+        - name: servicemeshoperator3
+          defaultChannel: stable
+          channels:
+            - name: stable
+
+        # LWS requires cert-manager. It is already installed by CRIAB, but a
+        # regenerated index missing it would leave OLM unable to resolve the
+        # dependency on any future reinstall.
+        - name: openshift-cert-manager-operator
+          defaultChannel: stable-v1
+          channels:
+            - name: stable-v1

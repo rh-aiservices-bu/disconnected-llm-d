@@ -1,0 +1,42 @@
+# Images llm-d needs that are NOT already in the CRIAB mirror.
+#
+# This file is the source; scripts/10-stage-images.sh appends these lines into
+# CRIAB's config/additional-images.txt, which is what oc-mirror actually reads.
+# Kept here as well so this repo records its own requirements — a rebuilt
+# environment can reconstruct the list without reading a script.
+#
+# It is short by design. Everything else llm-d runs arrives through content
+# CRIAB already mirrors:
+#
+#   vLLM serving image         RHOAI operator bundle relatedImages
+#   endpoint picker/scheduler  RHOAI operator bundle relatedImages
+#   storage initializer        RHOAI operator bundle relatedImages
+#   Istio proxy / gateway      servicemeshoperator3 bundle (INSTALL_SERVICE_MESH3)
+#
+# scripts/20-verify-mirror.sh checks that claim against the running cluster
+# rather than trusting it.
+#
+# Digest-pinned. A tag that moves between mirror time and deploy time produces a
+# pull error naming an image you are certain you mirrored, which is a genuinely
+# hard failure to reason about on a disconnected cluster.
+#
+# Re-pin with: scripts/10-stage-images.sh --resolve
+
+# ModelCar: Qwen2.5-0.5B-Instruct  (tag qwen2.5-0.5b-instruct, ~0.9 GiB)
+# The smoke-test model — proves the whole path cheaply.
+quay.io/redhat-ai-services/modelcar-catalog@sha256:e20441c23be795838409137576b9016e6bc941eec79e5765cf9de6319c0ec769
+
+# ModelCar: Qwen3-4B  (tag qwen3-4b, ~7.6 GiB)
+# The demo model. Fits comfortably in one L40S (48 GB) or A10G (24 GB).
+quay.io/redhat-ai-services/modelcar-catalog@sha256:2252a63e6f0f36df27ace6497330dfba61b7501024cf44fa67480d3848471809
+
+# httpd base for the in-cluster kernel/CUDA package repo that lets the NVIDIA
+# driver compile without reaching developer.download.nvidia.com. Only needed if
+# scripts/14-gpu-driver-disconnected.sh diagnose says the CUDA fetch is failing
+# — but mirror it in the same batch as the models, because discovering you need
+# it later costs another full low->high round trip.
+#
+# Not digest-pinned: it is a build input rather than something the cluster runs
+# directly, and pinning it would mean re-pinning on every UBI refresh for no
+# reproducibility gain — the repo image built FROM it is what the cluster pulls.
+registry.access.redhat.com/ubi9/httpd-24:latest

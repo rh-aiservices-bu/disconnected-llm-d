@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-llm
+  annotations:
+    openshift.io/display-name: Demo - llm-d (disconnected)
+  labels:
+    # Lets the in-cluster Prometheus scrape the vLLM PodMonitor without a
+    # separate user-workload-monitoring opt-in.
+    openshift.io/cluster-monitoring: "true"

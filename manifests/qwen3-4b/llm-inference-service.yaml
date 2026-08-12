@@ -1,0 +1,143 @@
+# llm-d serving Qwen3-4B, disconnected.
+#
+# The one substantive difference from a connected deployment is spec.model.uri:
+#
+#   connected     uri: hf://Qwen/Qwen3-4B
+#   disconnected  uri: oci://quay.io/redhat-ai-services/modelcar-catalog@sha256:...
+#
+# hf:// makes the storage-initializer reach huggingface.co, which does not exist
+# from this cluster. oci:// (KServe "ModelCar") carries the weights as a normal
+# container image, so they travel the same mirror path as every other image and
+# IDMS redirects the pull to Quay on the high side. Nothing here names the
+# mirror registry — that is deliberate, and keeps the manifest portable.
+#
+# oci:// requires enableModelcar=true in the KServe inferenceservice-config
+# ConfigMap. It is off by default. scripts/30-enable-modelcar.sh sets it.
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: qwen3-4b
+  namespace: demo-llm
+  annotations:
+    opendatahub.io/hardware-profile-name: gpu-profile
+    opendatahub.io/hardware-profile-namespace: redhat-ods-applications
+    opendatahub.io/model-type: generative
+    openshift.io/display-name: qwen3-4b
+    security.opendatahub.io/enable-auth: 'false'
+spec:
+  # One GPU per replica. scripts/40-deploy.sh patches this from LLMD_REPLICAS.
+  replicas: 1
+
+  model:
+    # quay.io/redhat-ai-services/modelcar-catalog:qwen3-4b — 7.6 GiB.
+    # Digest-pinned: a tag that moves between mirror time and deploy time is a
+    # genuinely confusing failure on a disconnected cluster, because the pull
+    # error names an image you believe you mirrored.
+    uri: oci://quay.io/redhat-ai-services/modelcar-catalog@sha256:2252a63e6f0f36df27ace6497330dfba61b7501024cf44fa67480d3848471809
+    # The name vLLM advertises as --served-model-name, i.e. what goes in the
+    # "model" field of an OpenAI-format request body.
+    name: Qwen/Qwen3-4B
+
+  router:
+    # Empty maps mean "let KServe create and manage these". The HTTPRoute is
+    # generated at /{namespace}/{name}/... on the Gateway below.
+    route: {}
+    gateway: {}
+    scheduler:
+      template:
+        containers:
+          - name: main
+            env:
+              # The scheduler writes tokenizer/cache scratch under these paths.
+              # Pointed at emptyDir mounts because the container filesystem is
+              # read-only and $HOME is not writable under restricted-v2.
+              - name: TOKENIZER_CACHE_DIR
+                value: /tmp/tokenizer-cache
+              - name: HF_HOME
+                value: /tmp/tokenizer-cache
+              - name: TRANSFORMERS_CACHE
+                value: /tmp/tokenizer-cache
+              - name: XDG_CACHE_HOME
+                value: /tmp
+            args:
+              - '--cert-path'
+              - /var/run/kserve/tls
+              - '--pool-group'
+              - inference.networking.x-k8s.io
+              - '--pool-name'
+              - '{{ ChildName .ObjectMeta.Name `-inference-pool` }}'
+              - '--pool-namespace'
+              - '{{ .ObjectMeta.Namespace }}'
+              - '--zap-encoder'
+              - json
+              - '--grpc-port'
+              - '9002'
+              - '--grpc-health-port'
+              - '9003'
+              - '--secure-serving'
+              - '--model-server-metrics-scheme'
+              - https
+              - '--config-text'
+              - |
+                apiVersion: inference.networking.x-k8s.io/v1alpha1
+                kind: EndpointPickerConfig
+                plugins:
+                - type: single-profile-handler
+                - type: queue-scorer
+                - type: active-request-scorer
+                - type: prefix-cache-scorer
+                schedulingProfiles:
+                - name: default
+                  plugins:
+                  - pluginRef: queue-scorer
+                    weight: 2
+                  - pluginRef: active-request-scorer
+                    weight: 2
+                  # The point of llm-d: route a request to the replica that
+                  # already holds its prefix in KV cache, instead of round
+                  # robin. With one replica this scorer is inert — it only
+                  # earns its keep at replicas >= 2.
+                  - pluginRef: prefix-cache-scorer
+                    weight: 3
+            volumeMounts:
+              - name: tokenizer-cache
+                mountPath: /tmp/tokenizer-cache
+              - name: cachi2-cache
+                mountPath: /cachi2
+        volumes:
+          - name: tokenizer-cache
+            emptyDir: {}
+          - name: cachi2-cache
+            emptyDir: {}
+
+  template:
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    containers:
+      - name: main
+        env:
+          - name: VLLM_ADDITIONAL_ARGS
+            value: "--disable-uvicorn-access-log --max-model-len=16000"
+        resources:
+          limits:
+            cpu: '2'
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: '2'
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTPS
+          # The ModelCar sidecar has to materialise 7.6 GiB before vLLM can
+          # load it, and vLLM then compiles CUDA graphs. Restarting the pod
+          # partway through that turns a slow start into an infinite loop.
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 30
+          failureThreshold: 5
