@@ -1,0 +1,59 @@
+# Mirror rules for the images this project adds — a REFERENCE COPY.
+#
+# You do not normally apply this file. oc-mirror generates the real one at
+#   <WORKDIR>/working-dir/cluster-resources/idms-oc-mirror.yaml
+# with your registry address already filled in. This exists so you can see the
+# shape it should end up, and to recover by hand if the generated file is lost.
+#
+# TWO RULES WHEN APPLYING, AND BREAKING EITHER DELETES WORKING CONFIGURATION
+#
+# 1. RENAME IT. oc-mirror always emits the name `idms-generic-0`. Every other
+#    oc-mirror batch on the cluster — from any project — emits that same name,
+#    and `oc apply` will replace yours with theirs. Hence idms-llmd-generic-0.
+#
+# 2. MERGE, DO NOT REPLACE. `oc apply` replaces the whole object. On an
+#    incremental run oc-mirror regenerates the file from only what was in the
+#    current archive, so applying it deletes the rules for everything mirrored
+#    earlier. Use scripts/18-push-images.sh, which unions the rules, or the jq
+#    snippet in the README's Step 5.
+#
+# Replace REGISTRY:PORT with your mirror registry, and llmd with your namespace
+# if you changed LLMD_MIRROR_NAMESPACE.
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: idms-llmd-generic-0
+  annotations:
+    llmd.criab/owner: disconnected-llm-d
+spec:
+  imageDigestMirrors:
+    # Model weights (ModelCar)
+    - source: quay.io/redhat-ai-services
+      mirrors:
+        - REGISTRY:PORT/llmd/redhat-ai-services
+
+    # vLLM serving runtimes. Note "rhaii" — one i, no trailing s. Several
+    # upstream examples use rhaiis/, which no mirror rule covers.
+    - source: registry.redhat.io/rhaii
+      mirrors:
+        - REGISTRY:PORT/llmd/rhaii
+
+    # llm-d components: inference scheduler, routing sidecar, KV-cache,
+    # storage initializer.
+    - source: registry.redhat.io/rhoai
+      mirrors:
+        - REGISTRY:PORT/llmd/rhoai
+---
+# Tag-referenced images need an ImageTagMirrorSet as well — IDMS only covers
+# digests. The httpd base for the GPU kernel repo is the only tagged image here.
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: itms-llmd-generic-0
+  annotations:
+    llmd.criab/owner: disconnected-llm-d
+spec:
+  imageTagMirrors:
+    - source: registry.access.redhat.com/ubi9
+      mirrors:
+        - REGISTRY:PORT/llmd/ubi9

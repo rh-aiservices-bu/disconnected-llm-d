@@ -1,0 +1,23 @@
+# Make the Gateway's AWS load balancer INTERNAL.
+#
+#   oc patch gateway openshift-ai-inference -n openshift-ingress \
+#     --type=merge --patch-file manifests/gateway/internal-nlb-patch.yaml
+#
+# On AWS the Gateway's Service defaults to an EXTERNAL NLB with public IPs.
+# Inside a disconnected VPC those are unreachable from everywhere that matters:
+# the bastion cannot reach them, and pods resolving the gateway hostname cannot
+# either. The symptom is a Gateway that reports Programmed=True and then times
+# out or returns EOF — which reads as a serving fault rather than a load
+# balancer one.
+#
+# The annotation only affects Service CREATION, so an already-created external
+# NLB keeps its public IPs until the Service is deleted and recreated:
+#
+#   oc delete svc openshift-ai-inference-openshift-default -n openshift-ingress
+#
+# The gateway controller recreates it as an internal NLB within a minute or two.
+# scripts/40-deploy.sh does all of this automatically when the platform is AWS.
+spec:
+  infrastructure:
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-internal: "true"

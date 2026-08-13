@@ -1,0 +1,30 @@
+# Points the NVIDIA driver container at a local package repo.
+#
+#   oc apply -f manifests/gpu/kernel-repo-config.yaml
+#
+# Only needed when the driver cannot build because it cannot reach
+# developer.download.nvidia.com for CUDA development packages. Run the
+# diagnosis first — the kernel half of the build is normally already solved by
+# the Driver Toolkit, which ships in the OpenShift release payload and is
+# therefore already mirrored:
+#
+#   scripts/14-gpu-driver-disconnected.sh diagnose
+#
+# The baseurl below points at the in-cluster repo from kernel-repo.yaml. Change
+# it only if you are serving the packages some other way — but note that the
+# driver pod runs `dnf install` on EVERY start (node reboots, MachineSet
+# scale-ups, operator upgrades), not once. A repo served from a shell on a
+# bastion is gone by the second of those, and the GPU silently stops working.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kernel-repo-config
+  namespace: nvidia-gpu-operator
+data:
+  local-kernel.repo: |
+    [local-kernel]
+    name=Local kernel and CUDA packages (disconnected)
+    baseurl=http://gpu-kernel-repo.nvidia-gpu-operator.svc:8080/
+    enabled=1
+    gpgcheck=0
+    priority=1

@@ -1,0 +1,24 @@
+# Tell the NVIDIA GPU operator to use the local package repo.
+#
+#   oc patch clusterpolicy gpu-cluster-policy --type=merge \
+#     --patch-file manifests/gpu/clusterpolicy-repoconfig-patch.yaml
+#
+# Apply kernel-repo.yaml and kernel-repo-config.yaml first, or the driver pod
+# will fail against a repo that is not being served.
+#
+# After patching, delete the driver pods so the retry is immediate and the log
+# is clean rather than full of the previous failures:
+#
+#   oc delete pod -n nvidia-gpu-operator -l app=nvidia-driver-daemonset
+#
+# Compilation then takes 5-10 minutes. Watch it, and confirm capacity appears:
+#
+#   oc logs -n nvidia-gpu-operator -l app=nvidia-driver-daemonset --all-containers -f
+#   oc get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.capacity.nvidia\.com/gpu
+#
+# Check the ClusterPolicy is actually named gpu-cluster-policy first:
+#   oc get clusterpolicy
+spec:
+  driver:
+    repoConfig:
+      configMapName: kernel-repo-config
